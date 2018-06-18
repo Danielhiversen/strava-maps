@@ -1,0 +1,36 @@
+{% extends "main.html" %}
+
+{% block title %}
+
+{% endblock %}
+
+{% block container %}
+<div class="page">
+  <table class="longtable">
+    <tr>
+      <th><a href="/activities?sort=start_date">Date</a></th>
+      <th><a href="/activities?sort=start_date">Time</a></th>
+      <th width="50px"><a href="/activities?sort=activity_name">Name</a></th>
+      <th><a href="/activities?sort=type">Type</a></th>
+      <th><a href="/activities?sort=distance">Distance</a></th>
+      <th><a href="/activities?sort=moving_time">Moving Time</a></th>
+      <th><a href="/activities?sort=average_speed">Avg Pace</a></th>
+      <th><a href="/activities?sort=max_speed">Max Pace</a></th>
+    </tr>
+
+
+    {% for key, activity in activities.iterrows() %}
+    <tr class="{{ loop.cycle('odd', 'even') }}">
+      <td>{{ activity.start_date_local | get_date }}</td>
+      <td>{{ activity.start_date_local | get_time }}</td>
+      <td><a href="{{ '/activity?id=%s'%activity.id }}"> {{ activity.activity_name }} </a></td>
+      <td>{{ activity.type }}</td>
+      <td>{{ (activity.distance / 1000.0) | round(2) }}</td>
+      <td>{{ activity.moving_time  | get_time }}</td>
+      <td>{{ activity.average_speed | speed_to_pace }}</td>
+      <td>{{ activity.max_speed  | speed_to_pace }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}
