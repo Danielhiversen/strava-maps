@@ -1,16 +1,25 @@
 #!/usr/bin/env python
 
-import branca.colormap as cm
-from datetime import datetime
+import datetime
+import errno
+import logging
+import os
+import random
+import shutil
+import string
 
+import branca.colormap as cm
+import dropbox
 import flask
 import folium
-import os
-import logging
+import gpxpy
+import gpxpy.gpx
 import numpy as np
 import pandas as pd
-import stravalib
+import requests
 
+
+import stravalib
 from flask_caching import Cache
 
 cache = Cache(config={'CACHE_TYPE': 'simple'})
@@ -47,23 +56,59 @@ def activities():
 
 @app.route('/activity')
 @app.route('/activity?id=<var>')
-@cache.cached(timeout=3600, key_prefix='view_activity')
+# @cache.cached(timeout=3600, key_prefix='view_activity')
 def view_activity():
     """ View an activity """
     if 'access_token' not in flask.session:
         return flask.redirect(flask.url_for('login'))
-    print("aaa")
     activity_id = flask.request.args.get('id')
     if activity_id is None:
         res = get_all_activities()
         activity_id = res['id'][0]
 
     client = stravalib.client.Client(access_token=flask.session['access_token'])
-    streams = client.get_activity_streams(activity_id, types=['latlng'], resolution='medium')
-
+    streams = client.get_activity_streams(activity_id, types=['latlng', 'time', 'altitude'], resolution='medium')
+    start_date = client.get_activity(activity_id).start_date
+    print(type(start_date))
     coords = streams['latlng'].data
+    gpx = gpxpy.gpx.GPX()
+
+    # Create first track in our GPX:
+    gpx_track = gpxpy.gpx.GPXTrack()
+    gpx.tracks.append(gpx_track)
+
+    # Create first segment in our GPX track:
+    gpx_segment = gpxpy.gpx.GPXTrackSegment()
+    gpx_track.segments.append(gpx_segment)
+
     for k in range(len(coords)):
         coords[k] = tuple(coords[k])
+        gpx_segment.points.append(gpxpy.gpx.GPXTrackPoint(latitude=coords[k][0], longitude=coords[k][1],
+                                                          elevation=streams['altitude'].data[k],
+                                                          time=start_date + datetime.timedelta(seconds=streams['time'].data[k])))
+
+        # geometry.append(Point((coords[k][1], coords[k][0])))
+        # data.append([(start_date + datetime.timedelta(seconds=streams['time'].data[k])).strftime('%Y-%m-%dT%H:%M:%S'),
+        #              streams['altitude'].data[k]])
+    dbx = dropbox.Dropbox(app.config['AUTH_TOKEN_DB'])
+
+    with open('my_lines.gpx', 'w') as f:
+        f.write(gpx.to_xml())
+    with open('my_lines.gpx', 'rb') as f:
+        dbx.files_upload(f.read(), '/my_lines.gpx', mode=dropbox.files.WriteMode('overwrite'))
+
+    gpx_url = dbx.sharing_create_shared_link('/my_lines.gpx').url.replace('dl=0', 'dl=1')
+    url = 'http://openwps.statkart.no/skwms1/wps.elevation2?request=Execute&' \
+          'service=WPS&version=1.0.0&identifier=elevationChart&dataInputs=gpx=@xlink:href={}'.format(gpx_url)
+    resp = requests.get(url=url)
+    print(resp)
+    data = resp.text
+    k = data.find('wps:ComplexData mimeType="image/png">')
+    l = data[k + 37:].find('</wps:ComplexData>')
+    img_url = data[k+37:k+37+l]
+    print(img_url)
+    altitude_image = img_url
+
     ctr = tuple(np.mean(coords, axis=0))
     m = folium.Map(location=ctr, zoom_start=12, tiles=None)
 
@@ -86,9 +131,9 @@ def view_activity():
     folium.Marker(coords[0], icon=folium.Icon(color='green')).add_to(m)
     folium.Marker(coords[-1], icon=folium.Icon(color='black')).add_to(m)
 
-    flask.session['maps'] += [activity_id]
-    m.save('./strava_map/static/maps/{0}.html'.format(activity_id))
-    return flask.render_template('activity.html', id=activity_id, athlete=flask.session.get('athlete'))
+    m.save('./src/cache/{0}/{1}.html'.format(flask.session.get('user_id'), activity_id))
+    return flask.render_template('activity.html', id=activity_id,
+                                 athlete=flask.session.get('athlete'), altitude_image=altitude_image)
 
 
 @cache.cached(timeout=900, key_prefix='all_activities')
@@ -100,8 +145,8 @@ def get_all_activities():
     for activity in client.get_activities():
         val = {}
         activity_dict = activity.to_dict()
-        val['start_date_local'] = datetime.strptime(activity_dict.get('start_date_local', ''), '%Y-%m-%dT%H:%M:%S')
-        val['moving_time'] = datetime.strptime(activity_dict.get('moving_time', ''), '%H:%M:%S')
+        val['start_date_local'] = datetime.datetime.strptime(activity_dict.get('start_date_local', ''), '%Y-%m-%dT%H:%M:%S')
+        val['moving_time'] = datetime.datetime.strptime(activity_dict.get('moving_time', ''), '%H:%M:%S')
         val['activity_name'] = activity_dict.get('name', '')
         val['type'] = activity_dict.get('type', '')
         val['id'] = activity.id
@@ -142,11 +187,9 @@ def get_time_filter(dt):
 @app.route('/maps/<int:id>.html')
 def show_map(id):
     """ GIven an activity ID, get and show the map """
-    if 'access_token' not in flask.session or str(id) not in flask.session['maps']:
+    if 'access_token' not in flask.session:
         return flask.redirect(flask.url_for('login'))
-    print(str(id) not in flask.session['maps'])
-    print(flask.session['maps'], id)
-    return flask.send_file('./static/maps/{0}.html'.format(id))
+    return flask.send_file('./cache/{0}/{1}.html'.format(flask.session.get('user_id'), id))
 
 
 @app.route('/login')
@@ -162,12 +205,10 @@ def login():
 @app.route('/logout')
 def logout():
     flask.session.pop('access_token')
-    print(flask.session['maps'])
-    for _id in flask.session['maps']:
-        try:
-            os.remove('./strava_map/static/maps/{0}.html'.format(_id))
-        except OSError:
-            pass
+    try:
+        shutil.rmtree('./src/cache/{0}'.format(flask.session.get('user_id',' ')))
+    except OSError:
+        pass
     return flask.redirect(flask.url_for('homepage'))
 
 
@@ -179,6 +220,12 @@ def auth_done():
                                            client_secret=app.config['CLIENT_SECRET'],
                                            code=code)
     flask.session['athlete'] = client.get_athlete().to_dict()
+    flask.session['user_id'] = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(9))
     flask.session['access_token'] = token
-    flask.session['maps'] = []
+
+    try:
+        os.makedirs('./src/cache/{0}'.format(flask.session['user_id']))
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
     return flask.redirect(flask.url_for('homepage'))
